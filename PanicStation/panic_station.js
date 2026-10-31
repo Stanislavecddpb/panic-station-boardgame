@@ -8,6 +8,7 @@
  *  Запуск:
  *      node panic_station.js
  *  Затем открыть в браузере:  http://<адрес-сервера>:3000
+ *  Можно играть и за одним компьютером — кнопка «Играть за одним компьютером».
  *
  *  Файл ожидает рядом с собой папку  ./assets  (из архива PanicStation_assets.zip):
  *      assets/img/...   — картинки (вырезаны из фото и правил)
@@ -144,6 +145,7 @@ class Game {
     this.code = code;
     this.onChange = onChange || (() => {});
     this.phase = 'lobby';
+    this.local = false;           // все игроки за одним устройством (передают его по очереди)
     this.players = [];            // порядок = порядок хода (по часовой)
     this.adminId = null;
     this.options = { easy: false, hard: false, hostRule: false };
@@ -595,8 +597,10 @@ class Game {
       if (!this.over && after) after();
     };
     if (!Object.keys(asks).length) return finish({});
-    this.pending = { type: 'armor', id: ++this.seq, asks, answers: {}, finish, deadline: Date.now() + 45000 };
+    // за одним устройством таймера нет: нужно время, чтобы передать его атакованному
+    this.pending = { type: 'armor', id: ++this.seq, asks, answers: {}, finish, deadline: this.local ? null : Date.now() + 45000 };
     const pend = this.pending;
+    if (this.local) return;
     pend.timer = setTimeout(() => {
       if (this.pending !== pend) return;
       this.addLog('Время на бронежилет вышло.', null, 'sys');
@@ -1068,7 +1072,7 @@ class Game {
     const me = this.player(pid);
     const showAll = this.phase === 'over';
     const v = {
-      code: this.code, phase: this.phase, me: pid, adminId: this.adminId, options: this.options,
+      code: this.code, phase: this.phase, local: this.local, me: pid, adminId: this.adminId, options: this.options,
       colors: COLORS, items: ITEMS, roomTypes: ROOM_TYPES,
       players: this.players.map(p => ({
         id: p.id, name: p.name, color: p.color, seat: p.seat,
@@ -1150,7 +1154,7 @@ function clientMain() {
     if (es) es.close();
     es = new EventSource(`/api/stream?code=${encodeURIComponent(sess.code)}&token=${encodeURIComponent(sess.token)}`);
     es.addEventListener('state', ev => { S = JSON.parse(ev.data); render(); });
-    es.addEventListener('gone', () => { es.close(); saveSess(null); sess = null; S = null; toast('Комната не найдена (сервер перезапускался?)', 'err'); renderStart(); });
+    es.addEventListener('gone', () => { es.close(); hideCurtain(); renderHandoff(null); saveSess(null); sess = null; S = null; toast('Комната не найдена (сервер перезапускался?)', 'err'); renderStart(); });
     es.onerror = () => { $('#conn') && ($('#conn').className = 'conn bad'); };
     es.onopen = () => { $('#conn') && ($('#conn').className = 'conn ok'); };
   }
@@ -1175,6 +1179,8 @@ function clientMain() {
             <input id="cd" maxlength="5" placeholder="КОД" value="${esc(code)}" style="text-transform:uppercase;width:120px;text-align:center;letter-spacing:3px">
             <button id="bJoin" class="btn big">Войти</button>
           </div>
+          <div class="or">или</div>
+          <button id="bLocal" class="btn big">Играть за одним компьютером</button>
           <details class="pw"><summary>Пароль сервера (если друг его задал)</summary><input id="pw" type="password"></details>
         </div>
       </div>`;
@@ -1188,6 +1194,113 @@ function clientMain() {
       try { const r = await api('/api/join', { code: c, name: nm() }); sess = { code: r.code, token: r.token }; saveSess(sess); history.replaceState(null, '', '?code=' + r.code); connect(); }
       catch (e) { toast(e.message, 'err'); }
     };
+    $('#bLocal').onclick = () => renderLocalSetup($('#pw').value);
+  }
+
+  // ---------- игра за одним устройством: ввод имён ----------
+  function renderLocalSetup(password) {
+    document.body.className = 'start';
+    let saved = []; try { saved = JSON.parse(localStorage.getItem('ps_local_names') || '[]'); } catch (e) {}
+    const names = saved.length >= 2 ? saved : ['', '', '', ''];
+    const draw = () => {
+      $('#app').innerHTML = `
+        <div class="startbox">
+          <img class="cover" src="${IMG}cover.jpg" alt="">
+          <div class="startform">
+            <img class="logo" src="${IMG}logo.jpg" alt="Panic Station">
+            <p class="lead">Игра за одним компьютером. Устройство передаётся по кругу: перед каждым ходом экран закрывается, чтобы никто не подсмотрел чужие карты.</p>
+            <div class="lnames">${names.map((n, i) => `
+              <div class="row"><input data-i="${i}" maxlength="20" value="${esc(n)}" placeholder="Игрок ${i + 1}" style="flex:1">
+              ${names.length > 2 ? `<button class="btn tiny ghost" data-del="${i}" title="Убрать">✕</button>` : ''}</div>`).join('')}
+            </div>
+            ${names.length < 6 ? '<button class="btn" id="bAdd">+ Игрок</button>' : ''}
+            <small style="color:var(--mut)">По правилам 4–6 игроков. Порядок хода и цвета определятся случайно.</small>
+            <label class="opt"><input type="checkbox" data-opt="easy"> Полегче для людей: 2 карты заражения вместо 3</label>
+            <label class="opt"><input type="checkbox" data-opt="hard"> Посложнее для людей: для сожжения Улья нужно 4 канистры</label>
+            <label class="opt"><input type="checkbox" data-opt="hostRule"> Правило для новичков-Носителей</label>
+            <div class="row">
+              <button id="bGo" class="btn big">Начать игру</button>
+              <button id="bBack" class="btn ghost">Назад</button>
+            </div>
+          </div>
+        </div>`;
+      const sync = () => document.querySelectorAll('.lnames input').forEach(el => { names[+el.dataset.i] = el.value; });
+      document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { sync(); names.splice(+b.dataset.del, 1); draw(); });
+      if ($('#bAdd')) $('#bAdd').onclick = () => { sync(); names.push(''); draw(); };
+      $('#bBack').onclick = renderStart;
+      $('#bGo').onclick = async () => {
+        sync();
+        const list = names.map((n, i) => n.trim() || ('Игрок ' + (i + 1)));
+        try { localStorage.setItem('ps_local_names', JSON.stringify(names.map(n => n.trim()))); } catch (e) {}
+        const options = {}; document.querySelectorAll('[data-opt]').forEach(el => { options[el.dataset.opt] = el.checked; });
+        try {
+          const r = await api('/api/create', { local: true, names: list, options, password });
+          sess = { code: r.code, local: true, players: r.players, token: r.players[0].token };
+          saveSess(sess); history.replaceState(null, '', '?code=' + r.code); connect();
+        } catch (e) { toast(e.message, 'err'); }
+      };
+    };
+    draw();
+  }
+
+  // ---------- игра за одним устройством: шторка между игроками ----------
+  // Чей ввод сейчас нужен: участник обмена / атакованный (бронежилет) / ходящий игрок.
+  function needPid() {
+    if (!S || S.phase !== 'play') return null;
+    const P = S.pending;
+    const pickOne = ids => (ids.includes(ui.shownFor) ? ui.shownFor : ids[0]) || null;
+    if (P && P.type === 'trade') { const w = [P.a, P.b].filter(id => !P.picked.includes(id)); if (w.length) return pickOne(w); }
+    if (P && P.type === 'armor' && P.waiting.length) return pickOne(P.waiting);
+    if (P && P.type === 'entry') return P.pid;
+    return S.turn ? S.turn.pid : null;
+  }
+  function localName(pid) { const p = (sess.players || []).find(x => x.pid === pid); return p ? p.name : '?'; }
+  function checkCurtain() {
+    if (!sess || !sess.local || !S) return;
+    if (S.phase === 'over') { hideCurtain(); renderHandoff(null); return; }
+    const need = needPid();
+    if (!need || need === ui.shownFor) { if (need && S.me === need) hideCurtain(); renderHandoff(null); return; }
+    if (need === ui.dismissedFor) renderHandoff(need); else showCurtain(need);
+  }
+  function showCurtain(need) {
+    let c = $('#curtain');
+    if (c && c.dataset.need === need && !c.dataset.loading) return;
+    if (!c) { c = document.createElement('div'); c.id = 'curtain'; document.body.appendChild(c); }
+    c.dataset.need = need; delete c.dataset.loading;
+    const pl = S.players.find(p => p.id === need);
+    const col = pl ? S.colors[pl.color].hex : '#fff';
+    const prev = ui.shownFor && S.me === ui.shownFor ? ui.shownFor : null;
+    const why = S.pending && S.pending.type === 'trade' ? 'Нужно выбрать карту для обмена.'
+      : S.pending && S.pending.type === 'armor' ? 'Ваших персонажей атакуют — решите, играть ли бронежилет.'
+      : 'Ваш ход.';
+    c.innerHTML = `<div class="cbox">
+        <img class="logo" src="${IMG}logo.jpg" alt="">
+        <p>Передайте устройство игроку</p>
+        <h2 style="color:${col}">${esc(localName(need))}</h2>
+        <p class="cwhy">${why}</p>
+        <button class="btn big" id="cShow">Я — ${esc(localName(need))}, показать мой экран</button>
+        ${prev ? `<button class="btn ghost" id="cBack">← Вернуться к экрану ${esc(localName(prev))}</button>` : ''}
+      </div>`;
+    $('#cShow').onclick = () => switchViewer(need);
+    if ($('#cBack')) $('#cBack').onclick = () => { ui.dismissedFor = need; hideCurtain(); renderHandoff(need); };
+  }
+  function hideCurtain() { const c = $('#curtain'); if (c) c.remove(); }
+  function renderHandoff(need) {
+    let h = $('#handoff');
+    if (!need) { if (h) h.remove(); return; }
+    if (!h) { h = document.createElement('div'); h.id = 'handoff'; document.body.appendChild(h); }
+    h.innerHTML = `Дальше действует <b>${esc(localName(need))}</b> <button class="btn tiny" id="hGo">Закрыть экран и передать</button>`;
+    $('#hGo').onclick = () => { ui.dismissedFor = null; renderHandoff(null); showCurtain(need); };
+  }
+  function switchViewer(pid) {
+    ui.shownFor = pid; ui.dismissedFor = null; ui.minimized = {}; ui.sent = null;
+    renderHandoff(null);
+    if (S && S.me === pid) { hideCurtain(); render(); return; }
+    const p = sess.players.find(x => x.pid === pid); if (!p) return;
+    closeModal(true);
+    const c = $('#curtain'); if (c) { c.dataset.loading = '1'; c.innerHTML = '<div class="cbox"><p>Загрузка…</p></div>'; }
+    sess.token = p.token; saveSess(sess);
+    S = null; connect();
   }
 
   // ---------- лобби ----------
@@ -1235,7 +1348,8 @@ function clientMain() {
   }
   function leave() {
     if (!confirm('Выйти из комнаты на этом устройстве? (Вернуться можно по коду, но как новый игрок — только пока игра не началась)')) return;
-    if (es) es.close(); saveSess(null); sess = null; S = null; history.replaceState(null, '', '/'); renderStart();
+    if (es) es.close(); hideCurtain(); renderHandoff(null); ui.shownFor = ui.dismissedFor = null; ui.seen = { roll: 0, scan: 0, reveal: 0, over: false, chatN: 0 };
+    closeModal(true); saveSess(null); sess = null; S = null; history.replaceState(null, '', '/'); renderStart();
   }
 
   // ---------- главный рендер ----------
@@ -1244,6 +1358,7 @@ function clientMain() {
     if (S.phase === 'lobby') return renderLobby();
     if (!$('#game')) buildGameShell();
     renderTop(); renderBoard(); renderPlayers(); renderBottom(); renderSide(); renderPending(); handleEvents();
+    checkCurtain();
   }
 
   function buildGameShell() {
@@ -1257,7 +1372,7 @@ function clientMain() {
           <div id="banner"></div><div id="modeHint"></div>
         </div>
         <div id="side"><div id="players"></div>
-          <div class="tabs"><button data-tab="log" class="on">Журнал</button><button data-tab="chat">Чат <span id="chatN"></span></button></div>
+          <div class="tabs"><button data-tab="log" class="on">Журнал</button>${S.local ? '' : '<button data-tab="chat">Чат <span id="chatN"></span></button>'}</div>
           <div id="logbox"></div>
           <div id="chatbox"><div id="chatlog"></div><form id="chatf"><input id="chatin" maxlength="300" placeholder="Сообщение…" autocomplete="off"><button class="btn tiny">→</button></form></div>
         </div>
@@ -1283,6 +1398,7 @@ function clientMain() {
       <img class="tlogo" src="${IMG}logo.jpg" alt="">
       <div class="tstat">${status}</div>
       <div class="tinfo">
+        ${S.local && me ? `<span class="chip" title="Чей экран сейчас открыт" style="border-color:${S.colors[me.color].hex}">👤 ${esc(me.name)}</span>` : ''}
         ${roleBadge}
         <span title="Карты исследования (следующая видна всем)" class="chip clickable" id="expChip">🧭 ${S.expCount}</span>
         <span title="Колода поиска / сброс" class="chip">🂠 ${S.deckCount} / ${S.discardCount}</span>
@@ -1692,7 +1808,7 @@ function clientMain() {
     cl.scrollTop = cl.scrollHeight;
     const n = S.chat.length;
     if (ui.tab === 'chat') ui.seen.chatN = n;
-    $('#chatN').textContent = n > ui.seen.chatN ? '(' + (n - ui.seen.chatN) + ')' : '';
+    if ($('#chatN')) $('#chatN').textContent = n > ui.seen.chatN ? '(' + (n - ui.seen.chatN) + ')' : '';
   }
 
   // ---------- ожидания: обмен, броня, вход ----------
@@ -1757,7 +1873,7 @@ function clientMain() {
     const send = n => { ui.sent = key; act({ type: 'armor', n }).then(() => setTimeout(() => { if (ui.sent === key) { ui.sent = null; renderPending(); } }, 1500)); };
     const btns = [{ t: 'Не играть', f: () => send(0) }];
     for (let n = 1; n <= m.max; n++) btns.push({ t: `🛡 Бронежилет ×${n}`, f: () => send(n) });
-    showModal('Атака: ' + m.src, `<p>Ваши персонажи получают урон: <b>${hits}</b>.</p><p>Каждый бронежилет предотвращает 1 урон (если оба ваших персонажа в одной комнате — защищает обоих). Можно сыграть: до ${m.max}.</p><p class="timer" data-deadline="${P.deadline}"></p>`, btns, null, key, true);
+    showModal('Атака: ' + m.src, `<p>Ваши персонажи получают урон: <b>${hits}</b>.</p><p>Каждый бронежилет предотвращает 1 урон (если оба ваших персонажа в одной комнате — защищает обоих). Можно сыграть: до ${m.max}.</p>${P.deadline ? `<p class="timer" data-deadline="${P.deadline}"></p>` : ''}`, btns, null, key, true);
   }
 
   // ---------- события: кубик, сканирование, рука соперника, финал ----------
@@ -1896,6 +2012,12 @@ input{background:#0c0e0f;border:1px solid #4a5157;color:var(--text);border-radiu
 .cbtn.on{border-color:var(--acc);background:#2b2a20}
 .cbtn:disabled{opacity:.3}
 .opt{display:block;margin:6px 0;color:#cfc6b3}
+.lnames{display:flex;flex-direction:column;gap:6px}
+#curtain{position:fixed;inset:0;z-index:90;background:#0b0d0e;display:flex;align-items:center;justify-content:center;text-align:center}
+#curtain .cbox{display:flex;flex-direction:column;gap:12px;align-items:center;max-width:92vw}
+#curtain .logo{width:300px;max-width:80vw;border-radius:6px}
+#curtain h2{font-size:34px;margin:0}#curtain .cwhy{color:var(--mut)}
+#handoff{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:80;background:rgba(40,35,10,.97);border:1px solid var(--acc);border-radius:8px;padding:8px 14px}
 /* игра */
 body.ingame{overflow:hidden}
 #game{display:grid;grid-template-columns:1fr 330px;grid-template-rows:54px 1fr 232px;height:100vh}
@@ -2143,6 +2265,18 @@ function startServer() {
         const code = newCode();
         const room = { game: null, listeners: new Set() };
         room.game = new Game(code, () => broadcast(room));
+        if (b.local) {
+          // игра за одним устройством: сразу все игроки, лобби не нужно
+          const names = (Array.isArray(b.names) ? b.names : []).slice(0, 6);
+          if (names.length < 2) return json(res, 400, { error: 'Нужно хотя бы 2 игрока' });
+          const g = room.game;
+          g.local = true;
+          const pls = names.map(n => g.addPlayer(n));
+          for (const k of ['easy', 'hard', 'hostRule']) g.options[k] = !!(b.options && b.options[k]);
+          g.start(g.adminId);
+          rooms.set(code, room);
+          return json(res, 200, { code, local: true, players: pls.map(p => ({ pid: p.id, token: p.token, name: p.name })) });
+        }
         rooms.set(code, room);
         const pl = room.game.addPlayer(b.name);
         return json(res, 200, { code, token: pl.token, pid: pl.id });
