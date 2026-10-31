@@ -459,7 +459,7 @@ class Game {
   }
   othersIn(key, p) { return [...new Set(this.charsIn(key).filter(x => x.p !== p).map(x => x.p))]; }
   isItem(c) { return c.t !== 'infect' && c.t !== 'host'; }
-  canPlayFromHand(p) { return p.hand.length > 5; }
+  canTrade(p) { return p.hand.some(c => this.canGive(p, c)); }
   takeFromHand(p, cardId, type) {
     const i = p.hand.findIndex(c => c.id === cardId && (!type || c.t === type));
     must(i >= 0, 'Такой карты нет на руке');
@@ -556,7 +556,7 @@ class Game {
     for (const [pid, hits] of Object.entries(by)) {
       const p = this.player(pid);
       const armor = p.hand.filter(c => c.t === 'armor').length;
-      const maxPlay = Math.min(armor, p.hand.length - 5);
+      const maxPlay = armor;
       const same = hits.trooper && hits.android && p.chars.trooper.room === p.chars.android.room;
       const useful = same ? Math.max(hits.trooper, hits.android) : (hits.trooper || 0) + (hits.android || 0);
       const max = Math.min(maxPlay, useful);
@@ -828,7 +828,6 @@ class Game {
       case 'equip': {
         const card = p.hand.find(x => x.id === a.card);
         must(card && TABLE_ITEMS.includes(card.t), 'Эту карту нельзя выложить на стол');
-        must(this.canPlayFromHand(p), 'На руке всегда должно оставаться минимум 5 карт');
         if (card.t !== 'ammo') must(!p.table[card.t], 'Такой предмет уже лежит у вас на столе');
         this.takeFromHand(p, card.id);
         if (card.t === 'ammo') p.table.ammo.push({ card, bullets: AMMO_PER_CARD }); else p.table[card.t] = card;
@@ -837,7 +836,6 @@ class Game {
       }
 
       case 'energy': {
-        must(this.canPlayFromHand(p), 'На руке всегда должно оставаться минимум 5 карт');
         this.discard.push(this.takeFromHand(p, a.card, 'energy'));
         t.ap += 2;
         this.addLog(`⚡ ${p.name} пьёт энергетик: +2 ОД.`);
@@ -845,7 +843,6 @@ class Game {
       }
 
       case 'firstaid': {
-        must(this.canPlayFromHand(p), 'На руке всегда должно оставаться минимум 5 карт');
         const c = ch(a.healer);
         const alloc = Array.isArray(a.alloc) ? a.alloc : [];
         let total = 0;
@@ -865,7 +862,6 @@ class Game {
 
       case 'scanner': {
         const c = ch(a.kind); needAP();
-        must(this.canPlayFromHand(p), 'На руке всегда должно оставаться минимум 5 карт');
         const q = this.player(a.target);
         must(q && q !== p && this.charsIn(c.room).some(x => x.p === q), 'Цель должна быть в одной комнате с вашим персонажем');
         this.discard.push(this.takeFromHand(p, a.card, 'scanner'));
@@ -879,7 +875,6 @@ class Game {
 
       case 'grenade': {
         const c = ch(a.kind); needAP();
-        must(this.canPlayFromHand(p), 'На руке всегда должно оставаться минимум 5 карт');
         const l = this.links(c.room).find(l => l.to === a.room);
         must(l && this.passable(p, l), 'Гранату можно бросить только в соседнюю (доступную) комнату');
         this.discard.push(this.takeFromHand(p, a.card, 'grenade'));
@@ -986,8 +981,10 @@ class Game {
       t.runFree[kind] = key;
       this.priv(p, `🏃 ${KIND_RU[kind]} в комнате «Бег»: следующее перемещение отсюда — бесплатно (если не обыскивать).`);
     }
-    if (type !== 'reactor' && others.length && !t.traded.has(key) && !t.attacked.has(key)) {
-      this.pending = { type: 'entry', id: ++this.seq, pid: p.id, kind, room: key, partners: others.map(q => q.id) };
+    // без минимума карт на руке кому-то может быть нечего отдать — с ним обмен не начинаем
+    const partners = this.canTrade(p) ? others.filter(q => this.canTrade(q)) : [];
+    if (type !== 'reactor' && partners.length && !t.traded.has(key) && !t.attacked.has(key)) {
+      this.pending = { type: 'entry', id: ++this.seq, pid: p.id, kind, room: key, partners: partners.map(q => q.id) };
       this.addLog(`${p.name} входит в комнату к ${others.map(q => q.name).join(', ')} — обмен или атака.`, null, 'trade');
     }
   }
@@ -1369,7 +1366,7 @@ function clientMain() {
         <div id="top"></div>
         <div id="boardWrap"><div id="boardInner"></div>
           <div class="zoombtns"><button class="btn tiny" id="zIn">+</button><button class="btn tiny" id="zOut">−</button><button class="btn tiny" id="zFit">⤢</button></div>
-          <div id="banner"></div><div id="modeHint"></div>
+          <div id="banner"></div><div id="modeHint"></div><div id="nextExp" title="Следующая карта исследования — её видят все"></div>
         </div>
         <div id="side"><div id="players"></div>
           <div class="tabs"><button data-tab="log" class="on">Журнал</button>${S.local ? '' : '<button data-tab="chat">Чат <span id="chatN"></span></button>'}</div>
@@ -1495,9 +1492,12 @@ function clientMain() {
     const inner = $('#boardInner');
     let html = '';
     for (const c of S.cards) html += `<div class="pos" style="left:${(c.x - B.x0) * TW}px;top:${(c.y - B.y0) * TH}px">${tileHTML(c, { hl })}</div>`;
+    // каждое допустимое место и поворот рисуется на поле; два поворота — две уменьшенные карты в клетке
+    const ghostTile = rot => { const o = S.expTop[rot === 180 ? 'o180' : 'o0']; return tileHTML({ rooms: o.rooms, e: o.e, red: false, art: S.expTop.art, id: 'g', rot }, { preview: true }); };
     for (const g of ghosts) {
-      const o = S.expTop[g.rots[0] === 180 ? 'o180' : 'o0'];
-      html += `<div class="pos gcell" data-gx="${g.x}" data-gy="${g.y}" style="left:${(g.x - B.x0) * TW}px;top:${(g.y - B.y0) * TH}px">${tileHTML({ rooms: o.rooms, e: o.e, red: false, art: S.expTop.art, id: 'g', rot: g.rots[0] }, { preview: true })}<div class="ghostlbl">Выложить сюда</div></div>`;
+      const pos = `left:${(g.x - B.x0) * TW}px;top:${(g.y - B.y0) * TH}px`;
+      if (g.rots.length === 1) html += `<div class="pos gcell" data-gx="${g.x}" data-gy="${g.y}" data-rot="${g.rots[0]}" style="${pos}">${ghostTile(g.rots[0])}<div class="ghostlbl">Выложить сюда${g.rots[0] === 180 ? '<br><small>(повёрнута на 180°)</small>' : ''}</div></div>`;
+      else html += `<div class="pos gpair" style="${pos}">${g.rots.map(rot => `<div class="gcell gmini" data-gx="${g.x}" data-gy="${g.y}" data-rot="${rot}">${ghostTile(rot)}<div class="ghostlbl">${rot === 180 ? '↻ 180°' : 'Как есть'}</div></div>`).join('')}</div>`;
     }
     inner.style.width = (B.x1 - B.x0 + 1) * TW + 'px';
     inner.style.height = (B.y1 - B.y0 + 1) * TH + 'px';
@@ -1507,13 +1507,19 @@ function clientMain() {
     // клики
     inner.querySelectorAll('.tok.ch.mine').forEach(el => el.onclick = ev => { ev.stopPropagation(); if (ui.dragged) return; ui.sel = el.dataset.kind; ui.mode = null; render(); });
     inner.querySelectorAll('.room').forEach(el => el.onclick = ev => { if (ui.dragged) return; onRoomClick(el.dataset.room); });
-    inner.querySelectorAll('.gcell').forEach(el => el.onclick = ev => { ev.stopPropagation(); if (ui.dragged) return; onGhostClick(+el.dataset.gx, +el.dataset.gy); });
+    inner.querySelectorAll('.gcell').forEach(el => el.onclick = ev => { ev.stopPropagation(); if (ui.dragged) return; onGhostClick(+el.dataset.gx, +el.dataset.gy, +el.dataset.rot); });
     const hint = $('#modeHint');
     if (ui.mode === 'explore') hint.innerHTML = 'Выберите место для новой локации <button class="btn tiny" id="mCancel">Отмена</button>';
     else if (ui.mode === 'reveal') hint.innerHTML = 'Терминал: выберите место для новой локации (любое) <button class="btn tiny" id="mCancel">Отмена</button>';
     else if (ui.mode === 'grenade') hint.innerHTML = 'Выберите соседнюю комнату для гранаты <button class="btn tiny" id="mCancel">Отмена</button>';
     else hint.innerHTML = '';
     hint.style.display = hint.innerHTML ? 'block' : 'none';
+    const nx = $('#nextExp');
+    if (S.expTop) {
+      nx.style.display = 'block';
+      nx.innerHTML = `Следующая локация <b>${esc(S.expTop.o0.rooms.map(r => S.roomTypes[r].ru).join(' / '))}</b><div class="nxt">${tileHTML({ rooms: S.expTop.o0.rooms, e: S.expTop.o0.e, red: false, art: S.expTop.art, id: 'nx' }, { preview: true })}</div><small>осталось ${S.expCount}</small>`;
+      nx.onclick = () => $('#expChip').click();
+    } else nx.style.display = 'none';
     if ($('#mCancel')) $('#mCancel').onclick = () => { ui.mode = null; ui.modeData = null; render(); };
   }
   function onRoomClick(key) {
@@ -1539,20 +1545,13 @@ function clientMain() {
     const d = S.roomTypes[rt];
     showModal(d.ru, `<p>${esc(d.desc)}</p>${card.red ? '<p class="warn">Карта перевёрнута на красную сторону: повторный обыск/использование привлечёт паразита.</p>' : ''}`, [{ t: 'OK' }]);
   }
-  function onGhostClick(x, y) {
+  function onGhostClick(x, y, rot) {
     const opts = S.opts; if (!opts) return;
     const list = ui.mode === 'reveal' ? opts.reveal : (opts.chars[ui.sel] || {}).explore || [];
-    const g = list.find(q => q.x === x && q.y === y); if (!g) return;
-    const send = rot => {
-      const mode = ui.mode; ui.mode = null;
-      if (mode === 'reveal') act({ type: 'terminal', kind: ui.sel, mode: 'reveal', x, y, rot });
-      else act({ type: 'explore', kind: ui.sel, x, y, rot });
-    };
-    if (g.rots.length === 1) return send(g.rots[0]);
-    showModal('Как повернуть карту?', `<div class="rotchoice">
-      <div class="rc" data-rot="0">${tileHTML({ rooms: S.expTop.o0.rooms, e: S.expTop.o0.e, red: false, art: S.expTop.art, id: 'r0' }, { preview: true })}<div>Как есть</div></div>
-      <div class="rc" data-rot="180">${tileHTML({ rooms: S.expTop.o180.rooms, e: S.expTop.o180.e, red: false, art: S.expTop.art, id: 'r1', rot: 180 }, { preview: true })}<div>Повернуть на 180°</div></div></div>`,
-      [{ t: 'Отмена' }], m => m.querySelectorAll('.rc').forEach(el => el.onclick = () => { closeModal(); send(+el.dataset.rot); }));
+    const g = list.find(q => q.x === x && q.y === y); if (!g || !g.rots.includes(rot)) return;
+    const mode = ui.mode; ui.mode = null;
+    if (mode === 'reveal') act({ type: 'terminal', kind: ui.sel, mode: 'reveal', x, y, rot });
+    else act({ type: 'explore', kind: ui.sel, x, y, rot });
   }
 
   // pan/zoom
@@ -1658,7 +1657,7 @@ function clientMain() {
     } else actions = `<div class="acts"><button class="btn" id="aOver">Итоги игры</button></div>`;
     const hand = S.hand.map(c => cardHTML(c, 'inhand')).join('');
     $('#bottom').innerHTML = `<div class="mychars">${chars}</div><div class="actbox">${actions}</div>
-      <div class="handbox"><div class="handtitle">Ваша рука (${S.hand.length}) <small>${S.hand.length <= 5 ? '— минимум 5: сейчас нельзя разыгрывать предметы' : ''}</small></div><div class="hand">${hand}</div></div>`;
+      <div class="handbox"><div class="handtitle">Ваша рука (${S.hand.length})</div><div class="hand">${hand}</div></div>`;
     document.querySelectorAll('.mychar').forEach(el => el.onclick = () => { ui.sel = el.dataset.kind; ui.mode = null; render(); });
     document.querySelectorAll('#bottom .hand .pcard').forEach(el => el.onclick = () => onHandCard(el.dataset.id));
     const on = (id, f) => { const el = $('#' + id); if (el) el.onclick = f; };
@@ -1744,15 +1743,14 @@ function clientMain() {
   function onHandCard(id) {
     const c = S.hand.find(x => x.id === id); if (!c) return;
     const it = S.items[c.t]; const me = myP();
-    const myTurn = !!S.opts; const canPlay = S.hand.length > 5;
+    const myTurn = !!S.opts;
     const btns = [];
-    const need = canPlay ? '' : ' (нужно >5 карт)';
     if (myTurn) {
-      if (['keycard', 'scope', 'heavygun', 'knife', 'ammo'].includes(c.t)) btns.push({ t: 'Выложить на стол' + need, dis: !canPlay, f: () => act({ type: 'equip', card: id }) });
-      if (c.t === 'energy') btns.push({ t: 'Выпить: +2 ОД' + need, dis: !canPlay, f: () => act({ type: 'energy', card: id }) });
-      if (c.t === 'firstaid') btns.push({ t: 'Использовать' + need, dis: !canPlay, f: () => doFirstAid(id) });
-      if (c.t === 'grenade') btns.push({ t: 'Бросить (1 ОД)' + need, dis: !canPlay || S.turn.ap < 1, f: () => { if (!S.opts.chars[ui.sel]) return toast('Выберите живого персонажа', 'err'); ui.mode = 'grenade'; ui.modeData = { card: id }; render(); } });
-      if (c.t === 'scanner') btns.push({ t: 'Сканировать (1 ОД)' + need, dis: !canPlay || S.turn.ap < 1, f: () => doScanner(id) });
+      if (['keycard', 'scope', 'heavygun', 'knife', 'ammo'].includes(c.t)) btns.push({ t: 'Выложить на стол', f: () => act({ type: 'equip', card: id }) });
+      if (c.t === 'energy') btns.push({ t: 'Выпить: +2 ОД', f: () => act({ type: 'energy', card: id }) });
+      if (c.t === 'firstaid') btns.push({ t: 'Использовать', f: () => doFirstAid(id) });
+      if (c.t === 'grenade') btns.push({ t: 'Бросить (1 ОД)', dis: S.turn.ap < 1, f: () => { if (!S.opts.chars[ui.sel]) return toast('Выберите живого персонажа', 'err'); ui.mode = 'grenade'; ui.modeData = { card: id }; render(); } });
+      if (c.t === 'scanner') btns.push({ t: 'Сканировать (1 ОД)', dis: S.turn.ap < 1, f: () => doScanner(id) });
     }
     btns.push({ t: 'Закрыть' });
     const extra = c.t === 'infect' ? (c.c === me.color ? (S.infected ? '<p class="warn">Это ваш цвет. Вы заражены — эту карту можно отдать при обмене, чтобы заразить партнёра.</p>' : '<p>Это ваш цвет. Пока вы человек, отдавать её нельзя.</p>') : `<p class="warn">Карта чужого цвета (${esc(S.colors[c.c].ru)}) — значит, игрок этого цвета пытался вас заразить. Она не заражает.</p>`) : '';
@@ -1954,7 +1952,7 @@ function clientMain() {
    <li><b>Терминал</b>: тепловое сканирование (сколько заражённых), открыть все двери до фазы паразитов, или выложить новую локацию где угодно.</li>
    <li><b>Лазарет</b>: +2 ♥.</li>
   </ul>
-  <p><b>Минимум 5 карт.</b> На руке всегда должно быть ≥5 карт — выложить/использовать предмет можно только при 6+ картах (кроме сожжения Улья).</p>
+  <p><b>Предметы</b> можно разыгрывать при любом количестве карт на руке (в этой версии нет правила «минимум 5 карт»). Если вам нечего отдать при обмене, обмен с вами не начинается.</p>
   <p><b>Обмен.</b> Войдя в комнату (кроме Реактора), где есть чужие персонажи, вы обязаны <b>обменяться</b> с одним из игроков картой вслепую — или атаковать его. Заражённый может отдать карту заражения <b>своего цвета</b>: получатель заражается, если в ответ не отдал <b>канистру</b>. Человек не может отдавать карты заражения своего цвета. Заражение действует на обоих ваших персонажей.</p>
   <p><b>Фаза паразитов.</b> Каждый круг (раз в «число игроков + 1» ходов) игрок с маркером бросает D4: все паразиты ползут в одном направлении (1 ↑, 2 →, 3 ↓, 4 ←, как на Реакторе), если там открытый проход. Потом атакуют всех в своей комнате: серый — 1 урон, чёрный — 2. Бронежилет снимает 1 урон (вам предложат сыграть его автоматически).</p>
   <p><b>Паразиты появляются</b> от «Тревоги» в колоде, при входе в комнату с паразитом на значке и при повторном использовании красных комнат: D4 → в соседнюю комнату в этом направлении (стены не мешают).</p>
@@ -2078,6 +2076,14 @@ body.ingame{overflow:hidden}
 .gcell:hover{opacity:.9}
 .gcell .tile{box-shadow:0 0 0 3px #f2b51b,0 0 25px #f2b51b}
 .ghostlbl{position:absolute;left:0;right:0;top:45%;text-align:center;font-family:Impact,sans-serif;color:#fff;text-shadow:0 0 6px #000,0 0 3px #000;font-size:16px;pointer-events:none}
+.gpair{width:150px;height:210px;display:flex;align-items:center;justify-content:space-between;padding:0 2px;box-sizing:border-box}
+.gmini{position:relative;width:72px;height:101px}
+.gmini .tile{transform:scale(.48);transform-origin:top left}
+.gmini .ghostlbl{top:auto;bottom:-20px;font-size:13px}
+#nextExp{position:absolute;left:8px;top:8px;z-index:5;background:rgba(15,17,18,.92);border:1px solid var(--acc);border-radius:8px;padding:6px;text-align:center;cursor:pointer;font-size:12px;color:var(--mut)}
+#nextExp .nxt{width:90px;height:126px;margin:4px auto 0;overflow:hidden}
+#nextExp .nxt .tile{transform:scale(.6);transform-origin:top left}
+#nextExp b{color:#fff;display:block;font-size:13px}
 .tok{width:38px;height:38px;border-radius:50%;position:relative;flex:0 0 auto}
 .tok.ch{border:3px solid var(--pc);box-shadow:0 2px 5px #000;background:#000}
 .tok.ch img{width:100%;height:100%;border-radius:50%;display:block}
