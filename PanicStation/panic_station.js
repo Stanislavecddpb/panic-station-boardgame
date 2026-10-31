@@ -148,6 +148,8 @@ class Game {
     this.local = false;           // все игроки за одним устройством (передают его по очереди)
     this.players = [];            // порядок = порядок хода (по часовой)
     this.adminId = null;
+    this.platform = false;        // стол платформы Zarya Boardgames: имя = ник аккаунта, мест — сколько заказала платформа
+    this.maxPlayers = 6;
     this.options = { easy: false, hard: false, hostRule: false };
     this.log = [];
     this.seq = 0;
@@ -159,8 +161,8 @@ class Game {
   // ---------------- лобби ----------------
   addPlayer(name) {
     must(this.phase === 'lobby', 'Игра уже началась');
-    must(this.players.length < 6, 'Максимум 6 игроков');
-    name = String(name || '').trim().slice(0, 20) || ('Игрок ' + (this.players.length + 1));
+    must(this.players.length < this.maxPlayers, this.maxPlayers < 6 ? 'Все места за этим столом заняты' : 'Максимум 6 игроков');
+    name = String(name || '').trim().slice(0, this.platform ? 24 : 20) || ('Игрок ' + (this.players.length + 1));
     const used = new Set(this.players.map(p => p.color));
     const p = {
       id: 'p' + crypto.randomBytes(4).toString('hex'),
@@ -176,6 +178,21 @@ class Game {
     return p;
   }
   player(id) { return this.players.find(p => p.id === id); }
+  byName(name) { name = String(name || '').trim().toLowerCase(); return this.players.find(p => p.name.toLowerCase() === name); }
+  /** Игрок встал из-за стола на платформе: в лобби уходит совсем, в идущей партии остаётся, но место считается свободным. */
+  leaveByName(name) {
+    const p = this.byName(name);
+    if (!p) return 0;
+    if (this.phase === 'lobby') {
+      this.players.splice(this.players.indexOf(p), 1);
+      if (this.adminId === p.id) this.adminId = this.players[0] ? this.players[0].id : null;
+      this.addLog(`${p.name} ушёл из-за стола.`);
+    } else if (!p.left) {
+      p.left = true;
+      this.addLog(`${p.name} встал из-за стола.`);
+    }
+    return 1;
+  }
   byToken(t) { return this.players.find(p => p.token === t); }
   pname(p) { return typeof p === 'string' ? (this.player(p) || {}).name : p.name; }
   cname(p, kind) { return `${p.name} (${KIND_RU[kind]})`; }
@@ -1048,7 +1065,7 @@ class Game {
       must(!this.players.some(q => q !== p && q.color === a.color), 'Цвет занят');
       p.color = a.color; return;
     }
-    if (a.type === 'rename') { p.name = String(a.name || '').trim().slice(0, 20) || p.name; return; }
+    if (a.type === 'rename') { must(!this.platform, 'На платформе имя берётся из аккаунта'); p.name = String(a.name || '').trim().slice(0, 20) || p.name; return; }
     if (a.type === 'options') {
       must(p.id === this.adminId, 'Настройки меняет создатель комнаты');
       for (const k of ['easy', 'hard', 'hostRule']) if (k in a) this.options[k] = !!a[k];
@@ -1069,7 +1086,7 @@ class Game {
     const me = this.player(pid);
     const showAll = this.phase === 'over';
     const v = {
-      code: this.code, phase: this.phase, local: this.local, me: pid, adminId: this.adminId, options: this.options,
+      code: this.code, phase: this.phase, local: this.local, platform: this.platform, maxPlayers: this.maxPlayers, me: pid, adminId: this.adminId, options: this.options,
       colors: COLORS, items: ITEMS, roomTypes: ROOM_TYPES,
       players: this.players.map(p => ({
         id: p.id, name: p.name, color: p.color, seat: p.seat,
@@ -1130,8 +1147,14 @@ function clientMain() {
   const ui = { sel: 'trooper', mode: null, zoom: 1, panX: 0, panY: 0, fitted: false, seen: { roll: 0, scan: 0, reveal: 0, over: false, chatN: 0 }, tab: 'log', modalKey: null, minimized: {}, lastLogN: 0 };
 
   // ---------- сессия ----------
-  function loadSess() { try { return JSON.parse(localStorage.getItem('ps_session') || 'null'); } catch (e) { return null; } }
-  function saveSess(s) { try { if (s) localStorage.setItem('ps_session', JSON.stringify(s)); else localStorage.removeItem('ps_session'); } catch (e) {} }
+  // Платформа Zarya Boardgames открывает стол ссылкой /?name=<ник>&embed=1#/m/<код>: имя — из аккаунта,
+  // кнопки «выйти» прячем (встать из-за стола можно на платформе), место запоминаем отдельно для каждого стола.
+  const QS = new URLSearchParams(location.search);
+  const PLATFORM = { code: ((location.hash.match(/^#\/m\/([A-Za-z0-9]+)/) || [])[1] || '').toUpperCase(), name: (QS.get('name') || '').trim(), embed: QS.has('embed') };
+  if (PLATFORM.embed) document.documentElement.classList.add('embed');
+  const SESS_KEY = PLATFORM.code ? 'ps_seat:' + PLATFORM.code : 'ps_session';
+  function loadSess() { try { return JSON.parse(localStorage.getItem(SESS_KEY) || 'null'); } catch (e) { return null; } }
+  function saveSess(s) { try { if (s) localStorage.setItem(SESS_KEY, JSON.stringify(s)); else localStorage.removeItem(SESS_KEY); } catch (e) {} }
   function loadName() { try { return localStorage.getItem('ps_name') || ''; } catch (e) { return ''; } }
   function saveName(n) { try { localStorage.setItem('ps_name', n); } catch (e) {} }
 
@@ -1151,9 +1174,26 @@ function clientMain() {
     if (es) es.close();
     es = new EventSource(`/api/stream?code=${encodeURIComponent(sess.code)}&token=${encodeURIComponent(sess.token)}`);
     es.addEventListener('state', ev => { S = JSON.parse(ev.data); render(); });
-    es.addEventListener('gone', () => { es.close(); hideCurtain(); renderHandoff(null); saveSess(null); sess = null; S = null; toast('Комната не найдена (сервер перезапускался?)', 'err'); renderStart(); });
+    es.addEventListener('gone', () => {
+      es.close(); hideCurtain(); renderHandoff(null); saveSess(null); sess = null; S = null;
+      if (PLATFORM.code) return renderNotice('Партия закрыта', 'Этого стола больше нет. Создайте новый стол на платформе.');
+      toast('Комната не найдена (сервер перезапускался?)', 'err'); renderStart();
+    });
     es.onerror = () => { $('#conn') && ($('#conn').className = 'conn bad'); };
     es.onopen = () => { $('#conn') && ($('#conn').className = 'conn ok'); };
+  }
+
+  // ---------- вход за стол платформы ----------
+  function renderNotice(title, text) {
+    document.body.className = 'start';
+    $('#app').innerHTML = `<div class="startbox"><div class="startform"><img class="logo" src="${IMG}logo.jpg" alt="Panic Station"><h2>${esc(title)}</h2><p class="lead">${esc(text)}</p></div></div>`;
+  }
+  async function joinPlatform() {
+    try {
+      const saved = loadSess(); // место могли освободить на платформе — тогда сервер посадит заново
+      const r = await api('/api/join', { code: PLATFORM.code, name: PLATFORM.name, token: saved && saved.token });
+      sess = { code: r.code, token: r.token }; saveSess(sess); connect();
+    } catch (e) { renderNotice('Не получилось сесть за стол', e.message); }
   }
 
   // ---------- стартовый экран ----------
@@ -1310,8 +1350,8 @@ function clientMain() {
       <div class="lobbybox">
         <img class="logo" src="${IMG}logo.jpg" alt="">
         <h2>Комната <span class="code">${esc(S.code)}</span></h2>
-        <div class="invite">Ссылка для друзей: <input readonly value="${esc(link)}" id="lnk"> <button class="btn" id="bCopy">Копировать</button></div>
-        <h3>Игроки (${S.players.length}/6) <small>по правилам 4–6</small></h3>
+        ${S.platform ? '' : `<div class="invite">Ссылка для друзей: <input readonly value="${esc(link)}" id="lnk"> <button class="btn" id="bCopy">Копировать</button></div>`}
+        <h3>Игроки (${S.players.length}/${S.maxPlayers || 6}) <small>по правилам 4–6</small></h3>
         <div class="lplayers">${S.players.map(p => `
           <div class="lp ${p.id === S.me ? 'me' : ''}">
             <img src="${IMG}tok_trooper_${p.color}.png" class="lptok" style="border-color:${S.colors[p.color].hex}">
@@ -1335,7 +1375,7 @@ function clientMain() {
           <button class="btn ghost" id="bLeave">Выйти</button>
         </div>
       </div>`;
-    $('#bCopy').onclick = () => { $('#lnk').select(); try { navigator.clipboard.writeText(link); } catch (e) { document.execCommand('copy'); } toast('Ссылка скопирована'); };
+    if ($('#bCopy')) $('#bCopy').onclick = () => { $('#lnk').select(); try { navigator.clipboard.writeText(link); } catch (e) { document.execCommand('copy'); } toast('Ссылка скопирована'); };
     document.querySelectorAll('[data-color]').forEach(b => b.onclick = () => act({ type: 'color', color: b.dataset.color }));
     document.querySelectorAll('[data-opt]').forEach(b => b.onchange = () => act({ type: 'options', [b.dataset.opt]: b.checked }));
     document.querySelectorAll('[data-kick]').forEach(b => b.onclick = () => act({ type: 'kick', target: b.dataset.kick }));
@@ -1962,9 +2002,11 @@ function clientMain() {
 
   // ---------- старт ----------
   sess = loadSess();
-  const urlCode = new URLSearchParams(location.search).get('code');
+  const urlCode = QS.get('code');
   if (sess && urlCode && urlCode.toUpperCase() !== sess.code) sess = null;
-  if (sess) connect(); else renderStart();
+  if (PLATFORM.code) joinPlatform();
+  else if (sess) connect();
+  else renderStart();
 }
 
 // ---------------------------------------------------------------------------
@@ -1995,6 +2037,7 @@ input{background:#0c0e0f;border:1px solid #4a5157;color:var(--text);border-radiu
 .or{color:var(--mut);text-align:center;font-size:12px;text-transform:uppercase}
 .pw{color:var(--mut);font-size:12px}
 /* лобби */
+.embed #bLeave,.embed #bLeave2{display:none}
 .lobbybox{max-width:760px;margin:20px auto;background:rgba(22,25,27,.94);border:1px solid var(--line);border-radius:10px;padding:24px}
 .lobbybox .code{color:var(--acc);letter-spacing:4px}
 .invite input{width:340px;max-width:60vw;font-size:12px}
@@ -2214,6 +2257,8 @@ const PORT = +process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ASSETS_DIR = path.resolve(process.env.ASSETS_DIR || path.join(__dirname, 'assets'));
 const GAME_PASSWORD = process.env.GAME_PASSWORD || '';
+const PLATFORM_SECRET = process.env.PLATFORM_SECRET || '';
+const BGIO_NAME = 'panic-station'; // имя игры в лобби-API для платформы
 const rooms = new Map(); // code -> { game, listeners:Set }
 
 const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.pdf': 'application/pdf', '.svg': 'image/svg+xml', '.css': 'text/css', '.js': 'text/javascript', '.json': 'application/json', '.txt': 'text/plain; charset=utf-8', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
@@ -2234,6 +2279,30 @@ function readBody(req) {
     let d = ''; req.on('data', ch => { d += ch; if (d.length > 1e5) { reject(new Error('too big')); req.destroy(); } });
     req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { reject(e); } });
   });
+}
+function closeRoom(code) {
+  const room = rooms.get(code);
+  if (!room) return false;
+  rooms.delete(code);
+  if (room.game.pending && room.game.pending.timer) clearTimeout(room.game.pending.timer);
+  for (const l of room.listeners) { try { l.res.write('event: gone\ndata: {}\n\n'); l.res.end(); } catch (e) {} }
+  return true;
+}
+/**
+ * Партия глазами платформы (как лобби-API boardgame.io): места 0..N-1, у занятых — name;
+ * gameover.winners — номера мест победителей (по ним платформа считает рейтинг).
+ */
+function matchMeta(g) {
+  const seats = g.platform ? g.maxPlayers : Math.max(g.players.length, 1);
+  const players = Array.from({ length: Math.max(seats, g.players.length) }, (_, id) => {
+    const p = g.players[id];
+    return p && !p.left ? { id, name: p.name } : { id };
+  });
+  const gameover = g.over ? {
+    side: g.over.side, reason: g.over.reason,
+    winners: g.over.winners.map(pid => String(g.players.findIndex(p => p.id === pid))),
+  } : null;
+  return { matchID: g.code, players, gameover };
 }
 function json(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -2265,6 +2334,37 @@ function startServer() {
       if (req.method === 'GET' && p.startsWith('/assets/')) return serveAsset(req, res, p.slice('/assets/'.length));
       if (req.method === 'GET' && p === '/health') return json(res, 200, { ok: true, rooms: rooms.size });
 
+      // ---- платформа Zarya Boardgames: лобби-API в духе boardgame.io и служебные маршруты ----
+      if (req.method === 'POST' && p === `/games/${BGIO_NAME}/create`) {
+        const b = await readBody(req);
+        const code = newCode();
+        const room = { game: null, listeners: new Set() };
+        room.game = new Game(code, () => broadcast(room));
+        room.game.platform = true;
+        room.game.maxPlayers = Math.max(2, Math.min(6, Math.floor(+b.numPlayers) || 6));
+        rooms.set(code, room);
+        return json(res, 200, { matchID: code });
+      }
+      const metaM = req.method === 'GET' && p.match(new RegExp(`^/games/${BGIO_NAME}/([A-Za-z0-9]+)$`));
+      if (metaM) {
+        const room = rooms.get(metaM[1].toUpperCase());
+        return room ? json(res, 200, matchMeta(room.game)) : json(res, 404, { error: 'Партия не найдена' });
+      }
+      const platM = PLATFORM_SECRET && p.match(/^\/platform\/matches\/([A-Za-z0-9]+)(\/leave)?$/);
+      if (platM) {
+        if (req.headers['x-platform-secret'] !== PLATFORM_SECRET) return json(res, 403, { error: 'forbidden' });
+        const code = platM[1].toUpperCase();
+        if (req.method === 'DELETE' && !platM[2]) return json(res, 200, { ok: closeRoom(code) });
+        if (req.method === 'POST' && platM[2]) {
+          const room = rooms.get(code);
+          if (!room) return json(res, 404, { error: 'Партия не найдена' });
+          const b = await readBody(req);
+          const left = room.game.leaveByName(b.playerName);
+          if (left) broadcast(room);
+          return json(res, 200, { left });
+        }
+      }
+
       if (req.method === 'POST' && p === '/api/create') {
         const b = await readBody(req);
         if (GAME_PASSWORD && b.password !== GAME_PASSWORD) return json(res, 403, { error: 'Неверный пароль сервера' });
@@ -2292,7 +2392,9 @@ function startServer() {
         const code = String(b.code || '').toUpperCase().trim();
         const room = rooms.get(code);
         if (!room) return json(res, 404, { error: 'Комната не найдена' });
-        if (b.token) { const pl = room.game.byToken(b.token); if (pl) return json(res, 200, { code, token: pl.token, pid: pl.id }); }
+        if (b.token) { const pl = room.game.byToken(b.token); if (pl) { pl.left = false; return json(res, 200, { code, token: pl.token, pid: pl.id }); } }
+        // за столом платформы ник = аккаунт: второго игрока с тем же ником не пускаем (место сохранено в браузере, где садились)
+        if (room.game.platform && room.game.byName(b.name)) return json(res, 409, { error: 'Вы уже сидите за этим столом в другом браузере — откройте игру там' });
         const pl = room.game.addPlayer(b.name);
         broadcast(room);
         return json(res, 200, { code, token: pl.token, pid: pl.id });
@@ -2351,4 +2453,4 @@ function startServer() {
 }
 
 if (require.main === module) startServer();
-module.exports = { Game, GameError, EXPLORATION, EXP_BY_ID, orient, startServer, SEARCH_DECK, rooms };
+module.exports = { Game, GameError, EXPLORATION, EXP_BY_ID, orient, startServer, SEARCH_DECK, rooms, matchMeta };
