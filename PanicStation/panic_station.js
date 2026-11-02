@@ -75,7 +75,7 @@ const ROOM_TYPES = {
   search:   { ru: 'Совместный обыск', icon: 'search',   desc: 'Можно обыскать вместе с другим игроком: 2 карты раздаются случайно.' },
   run:      { ru: 'Бег',              icon: 'run',      desc: 'Если в комнате нет чужих персонажей — 1 бесплатное перемещение дальше. Обыск отменяет.' },
   sickbay:  { ru: 'Лазарет',          icon: 'sickbay',  desc: '1 ОД: вылечить 2 раны (или по 1 обоим своим персонажам).' },
-  parasite: { ru: 'Тревога',          icon: 'parasite', desc: 'Каждый вход в комнату привлекает паразита (бросок D4).' },
+  parasite: { ru: 'Тревога',          icon: 'parasite', desc: 'Каждый обыск этой комнаты привлекает паразита: он появляется здесь, ползёт по броску D4 и атакует.' },
 };
 
 // Карты исследования. e = стены: t(верх) r(право) b(низ) l(лево).
@@ -86,7 +86,7 @@ const EXPLORATION = [
   { id: 'reactor', rooms: ['reactor'],           e: { t: 'D', r: 'D', b: 'D', l: 'D' }, art: 'room_reactor' },
   { id: 'hive',    rooms: ['hive'],              e: { t: 'W', r: 'D', b: 'D', l: 'W' }, art: 'room_hive' },
   { id: 'term1',   rooms: ['terminal'],          e: { t: 'D', r: 'W', b: 'D', l: 'D' }, openTerminal: true },
-  { id: 'term2',   rooms: ['terminal', 'empty'], e: { t: 'D', r: ['S', 'W'], b: 'D', l: ['W', 'D'] } },
+  { id: 'term2',   rooms: ['terminal'],          e: { t: 'W', r: 'W', b: 'D', l: 'W' } },   // закрытый терминал: один вход снизу
   { id: 'stor1',   rooms: ['storage'],           e: { t: 'D', r: 'D', b: 'W', l: 'D' } },
   { id: 'stor2',   rooms: ['storage'],           e: { t: 'W', r: 'D', b: 'D', l: 'D' } },
   { id: 'srch1',   rooms: ['search'],            e: { t: 'D', r: 'W', b: 'D', l: 'D' } },
@@ -96,7 +96,7 @@ const EXPLORATION = [
   { id: 'run1',    rooms: ['run'],               e: { t: 'D', r: 'D', b: 'D', l: 'D' } },
   { id: 'run2',    rooms: ['run'],               e: { t: 'D', r: 'W', b: 'D', l: 'W' } },
   { id: 'run3',    rooms: ['run'],               e: { t: 'D', r: 'D', b: 'W', l: 'D' } },
-  { id: 'sick1',   rooms: ['empty', 'sickbay'],  e: { t: 'S', r: ['D', 'W'], b: 'D', l: ['W', 'D'] } },
+  { id: 'sick1',   rooms: ['sickbay'],           e: { t: 'W', r: 'W', b: 'D', l: 'W' } },   // лазарет: один вход снизу
   { id: 'para1',   rooms: ['parasite'],          e: { t: 'D', r: 'W', b: 'D', l: 'D' } },
   { id: 'para2',   rooms: ['parasite'],          e: { t: 'W', r: 'D', b: 'D', l: 'D' } },
   { id: 'para3',   rooms: ['parasite'],          e: { t: 'D', r: 'W', b: 'D', l: 'S' } },
@@ -258,25 +258,20 @@ class Game {
     this.turn = null; this.turnNo = 0;
     this.addLog('— Игра началась! Порядок хода: ' + this.players.map(p => p.name).join(' → ') + ' —', null, 'sys');
 
-    // раздача по 2 карты; тревога в начале — паразит в Реактор и добрать
+    // раздача по 2 карты; «Тревога» при раздаче не срабатывает — карта уходит обратно в колоду,
+    // чтобы на станции в начале игры не было паразитов
     for (const p of this.players) {
-      let got = 0;
-      while (got < 2 && this.deck.length) {
+      let got = 0, guard = 0;
+      while (got < 2 && this.deck.length && guard++ < 100) {
         const c = this.deck.shift();
-        if (c.t === 'alert') {
-          this.discard.push(c);
-          const par = this.takeParasiteForSpawn();
-          if (par) par.room = this.cards[0].id + '.0';
-          this.addLog(`${p.name} вытягивает «Тревогу» при раздаче — паразит появляется в Реакторе.`, null, 'alert');
-          continue;
-        }
+        if (c.t === 'alert') { this.deck.splice(1 + rnd(this.deck.length), 0, c); continue; }
         this.giveCard(p, c, 'раздача');
         got++;
       }
     }
-    // Первая фаза паразитов происходит до того, как кто-то вошёл на станцию
+    // Фаза паразитов — в начале каждого раунда, кроме первого (тогда на станции ещё никого нет)
     this.markerIdx = 0;
-    this.turnsSincePP = 999;
+    this.rolls = []; this.dmgQueue = [];
     this.curIdx = -1;
     this.nextTurn();
   }
@@ -425,9 +420,12 @@ class Game {
   }
 
   // ---------------- кубик и паразиты ----------------
-  roll(byName, why) {
+  // kind: 'phase' | 'spawn' | 'knife'; для паразитов клиент показывает большое окно с броском
+  roll(byName, why, kind) {
     const v = 1 + rnd(4);
-    this.lastRoll = { v, by: byName, why, seq: ++this.rollSeq, dir: D4_DIR[v] };
+    this.lastRoll = { v, by: byName, why, kind: kind || 'other', seq: ++this.rollSeq, dir: D4_DIR[v], moves: [] };
+    this.rolls.push(this.lastRoll);
+    if (this.rolls.length > 10) this.rolls.shift();
     return v;
   }
   takeParasiteForSpawn() {
@@ -435,19 +433,34 @@ class Game {
     if (!par) { par = this.parasites.find(q => !q.room && q.disc === 'black'); if (par) par.side = 'black'; }
     return par || null;
   }
+  // куда паразит переползает из комнаты в направлении dir (только через открытый проход), иначе null
+  parasiteStep(key, dir) {
+    const R = this.roomInfo(key); const dbl = R.card.rooms.length === 2;
+    if (dbl && ((dir === 'down' && R.i === 0) || (dir === 'up' && R.i === 1))) return R.card.id + '.' + (1 - R.i);
+    const l = this.links(key).find(l => l.dir === dir && l.type === 'D');
+    return l ? l.to : null;
+  }
+  // Появление паразита: он возникает в комнате, бросается D4, паразит ползёт в эту сторону
+  // (если есть открытый проход) и только потом атакует всех, кто оказался с ним в комнате.
   spawn(originKey, who) {
-    const v = this.roll(who, 'появление паразита');
-    const dir = D4_DIR[v];
-    let target = this.dirNeighbor(originKey, dir) || originKey;
     let par = this.takeParasiteForSpawn();
-    let moved = false;
+    let relocated = false;
     if (!par) {
       const onBoard = this.parasites.filter(q => q.room);
       if (!onBoard.length) return;
-      par = onBoard[rnd(onBoard.length)]; moved = true;
+      par = onBoard[rnd(onBoard.length)]; relocated = true;
     }
-    par.room = target;
-    this.addLog(`🎲 ${who} бросает D4: ${v} (${DIRS[dir].ru}). ${moved ? 'Паразит перемещается' : (par.side === 'black' ? 'Чёрный паразит' : 'Серый паразит') + ' появляется'} в комнате «${this.roomName(target)}».`, null, 'alert');
+    par.room = originKey;
+    const v = this.roll(who, 'появление паразита', 'spawn');
+    const dir = D4_DIR[v];
+    const to = this.parasiteStep(originKey, dir);
+    if (to) par.room = to;
+    Object.assign(this.lastRoll, { spawnRoom: originKey, side: par.side, moves: [{ id: par.id, side: par.side, from: originKey, to: par.room, moved: !!to }] });
+    const what = par.side === 'black' ? 'Чёрный паразит' : 'Серый паразит';
+    this.addLog(`☣ ${what} ${relocated ? 'переносится' : 'появляется'} в комнате «${this.roomName(originKey)}». 🎲 ${who} бросает D4: ${v} (${DIRS[dir].ru}) — ${to ? `паразит ползёт в «${this.roomName(to)}»` : 'дальше прохода нет, паразит остаётся'}.`, null, 'alert');
+    const dmg = par.side === 'black' ? 2 : 1;
+    const batch = this.charsIn(par.room).map(x => ({ pid: x.p.id, kind: x.kind, amt: dmg, src: 'паразит' }));
+    this.damage(batch, null);
   }
   parasitesIn(key) { return this.parasites.filter(q => q.room === key); }
   hitParasite(par, n) {
@@ -500,22 +513,31 @@ class Game {
     if (this.over) return;
     const j = this.nextAliveFrom(this.curIdx < 0 ? this.players.length - 1 : this.curIdx);
     if (j < 0) return this.endGame('infected', 'Все персонажи погибли.');
-    const N = this.alivePlayers().length;
-    if (this.turnsSincePP >= N + 1) {
-      this.turnsSincePP = 0;
+    // новый раунд (круг замкнулся) — игрок, открывающий раунд, бросает кубик фазы паразитов
+    if (this.curIdx >= 0 && j <= this.curIdx) {
       const pp = this.players[j];
       this.markerIdx = j;
-      this.parasitePhase(pp, () => {
-        this.markerIdx = this.nextAliveFrom(j);
-        if (!this.alive(pp)) { this.curIdx = j; return this.nextTurn(); }
-        this.beginTurn(j);
-      });
-    } else this.beginTurn(j);
+      if (this.doorsOpen) { this.doorsOpen = false; this.addLog('Двери безопасности снова закрыты.', null, 'sys'); }
+      if (!this.parasites.some(q => q.room)) { this.addLog('☣ Новый раунд. Паразитов на станции нет — фаза паразитов пропущена.', null, 'phase'); return this.beginTurn(j); }
+      this.curIdx = j;
+      this.pending = { type: 'pphase', id: ++this.seq, pid: pp.id };
+      this.addLog(`☣ Фаза паразитов: ${pp.name} бросает кубик.`, null, 'phase');
+      return;
+    }
+    this.beginTurn(j);
+  }
+  rollPhase(p) {
+    this.pending = null;
+    const j = this.players.indexOf(p);
+    this.parasitePhase(p, () => {
+      if (!this.alive(p)) return this.nextTurn();
+      this.beginTurn(j);
+    });
   }
   beginTurn(j) {
     if (this.over) return;
     const p = this.players[j];
-    this.curIdx = j; this.turnsSincePP++; this.turnNo++;
+    this.curIdx = j; this.turnNo++;
     let first = false;
     if (!p.arrived) {
       p.arrived = true; first = true;
@@ -537,22 +559,19 @@ class Game {
     this.nextTurn();
   }
   parasitePhase(pp, after) {
-    if (this.doorsOpen) { this.doorsOpen = false; this.addLog('Двери безопасности снова закрыты.', null, 'sys'); }
     const onBoard = this.parasites.filter(q => q.room);
-    this.addLog(`☣ Фаза паразитов (маркер у игрока ${pp.name}).`, null, 'phase');
     if (onBoard.length) {
-      const v = this.roll(pp.name, 'движение паразитов');
+      const v = this.roll(pp.name, 'фаза паразитов', 'phase');
       const dir = D4_DIR[v];
       let movedN = 0;
       for (const q of onBoard) {
-        const R = this.roomInfo(q.room); const dbl = R.card.rooms.length === 2;
-        let to = null;
-        if (dbl && ((dir === 'down' && R.i === 0) || (dir === 'up' && R.i === 1))) to = R.card.id + '.' + (1 - R.i);
-        else { const l = this.links(q.room).find(l => l.dir === dir && l.type === 'D'); if (l) to = l.to; }
+        const from = q.room;
+        const to = this.parasiteStep(from, dir);
         if (to) { q.room = to; movedN++; }
+        this.lastRoll.moves.push({ id: q.id, side: q.side, from, to: q.room, moved: !!to });
       }
       this.addLog(`🎲 ${pp.name} бросает D4: ${v} — паразиты ползут ${DIRS[dir].ru} (сдвинулось: ${movedN} из ${onBoard.length}).`, null, 'alert');
-    } else this.addLog('Паразитов на станции нет.', null, 'sys');
+    }
     const batch = [];
     for (const p of this.players) for (const k of ['trooper', 'android']) {
       const c = p.chars[k]; if (!c.alive || !c.room) continue;
@@ -564,6 +583,8 @@ class Game {
 
   // ---------------- урон и броня ----------------
   damage(batch, after) {
+    // пока кто-то решает про бронежилет, следующие атаки ждут своей очереди
+    if (this.pending && this.pending.type === 'armor') { this.dmgQueue.push([batch, after]); return; }
     const by = {};
     for (const h of batch) {
       const p = this.player(h.pid); if (!p || !p.chars[h.kind].alive) continue;
@@ -612,6 +633,7 @@ class Game {
       }
       this.checkWin();
       if (!this.over && after) after();
+      if (!this.over && this.dmgQueue.length && !(this.pending && this.pending.type === 'armor')) { const [b, a] = this.dmgQueue.shift(); this.damage(b, a); }
     };
     if (!Object.keys(asks).length) return finish({});
     // за одним устройством таймера нет: нужно время, чтобы передать его атакованному
@@ -720,6 +742,7 @@ class Game {
     const P = this.pending;
     if (a.type === 'armor') { must(P && P.type === 'armor' && P.asks[p.id], 'Сейчас бронежилет не нужен'); return this.armorAnswer(p, a); }
     if (a.type === 'tradePick') { must(P && P.type === 'trade' && (P.a === p.id || P.b === p.id), 'Вы не участвуете в обмене'); return this.tradePick(p, a); }
+    if (a.type === 'pphaseRoll') { must(P && P.type === 'pphase' && P.pid === p.id, 'Сейчас кубик фазы паразитов бросает другой игрок'); return this.rollPhase(p); }
     must(this.turn && this.turn.pid === p.id, 'Сейчас не ваш ход');
     if (P) {
       must(P.type === 'entry', 'Ожидаем ответа других игроков');
@@ -759,6 +782,16 @@ class Game {
         const card = this.placeCard(def, a.x, a.y, a.rot);
         this.addLog(`🧭 ${this.cname(p, a.kind)} исследует: новая локация «${card.rooms.map(r => ROOM_TYPES[r].ru).join(' / ')}».`, null, 'explore');
         if (def.id === 'hive') { this.addLog('☣ ОБНАРУЖЕН УЛЕЙ! Автоматическое тепловое сканирование…', null, 'phase'); this.heatScan('найден Улей'); }
+        if (this.over) return;
+        // исследователь сразу входит в открытую комнату (это часть исследования, ОД не тратится)
+        // за закрытую дверь безопасности можно «заглянуть», но войти — только если она проходима
+        const into = this.links(c.room).find(l => l.to.startsWith(card.id + '.') && this.passable(p, l));
+        if (into) {
+          delete t.runFree[a.kind];
+          c.room = into.to;
+          this.addLog(`${this.cname(p, a.kind)} входит в «${this.roomName(into.to)}».`);
+          return this.onEnter(p, a.kind, into.to);
+        }
         return;
       }
 
@@ -783,13 +816,17 @@ class Game {
         t.ap--; t.searched = true; delete t.runFree[a.kind];
         this.addLog(`🔎 ${this.cname(p, a.kind)} обыскивает «${R.type === 'storage' && !R.card.red ? 'Склад (3 карты)' : ROOM_TYPES[R.type].ru}»${partner ? ' вместе с ' + partner.name : ''}.`);
         if (R.card.red) { this.addLog('Комната уже обыскана — шум привлекает паразита!', null, 'alert'); this.spawn(c.room, p.name); }
+        else if (R.type === 'parasite') { this.addLog('Шорох в вентиляции — обыск привлекает паразита!', null, 'alert'); this.spawn(c.room, p.name); }
+        const firstStorage = R.type === 'storage' && !R.card.red;
+        R.card.red = true;
+        if (this.over || !c.alive) return;
         if (partner) {
           const drawn = [this.drawSearch(), this.drawSearch()].filter(Boolean);
           shuffle(drawn);
           const who = [p, partner];
           drawn.forEach((card, k) => this.receiveSearch(who[k], card, c.room));
         } else {
-          const n = (R.type === 'storage' && !R.card.red) ? 3 : 1;
+          const n = firstStorage ? 3 : 1;
           for (let k = 0; k < n; k++) { const card = this.drawSearch(); if (card) this.receiveSearch(p, card, c.room); }
         }
         R.card.red = true;
@@ -992,7 +1029,6 @@ class Game {
   onEnter(p, kind, key) {
     const t = this.turn;
     const type = this.roomType(key);
-    if (type === 'parasite') { this.addLog('Шорох в вентиляции…', null, 'alert'); this.spawn(key, p.name); }
     const others = this.othersIn(key, p);
     if (type === 'run' && !others.length) {
       t.runFree[kind] = key;
@@ -1112,13 +1148,14 @@ class Game {
       discardTop: this.discard.length ? this.discard[this.discard.length - 1].t : null,
       turn: this.turn ? { pid: this.turn.pid, ap: this.turn.ap, first: this.turn.first, searched: this.turn.searched, usedTerminal: this.turn.usedTerminal, runFree: this.turn.runFree, no: this.turnNo } : null,
       markerPid: this.players[this.markerIdx] ? this.players[this.markerIdx].id : null,
-      doorsOpen: this.doorsOpen, lastRoll: this.lastRoll, lastScan: this.lastScan,
+      doorsOpen: this.doorsOpen, lastRoll: this.lastRoll, rolls: this.rolls.slice(-6), lastScan: this.lastScan,
       gasToBurn: this.gasToBurn, over: this.over,
       opts: me ? this.optionsFor(me) : null,
     });
     const P = this.pending;
     if (P) {
       if (P.type === 'entry') v.pending = { type: 'entry', id: P.id, pid: P.pid, kind: P.kind, room: P.room, partners: P.partners };
+      else if (P.type === 'pphase') v.pending = { type: 'pphase', id: P.id, pid: P.pid, onBoard: this.parasites.filter(q => q.room).length };
       else if (P.type === 'trade') {
         v.pending = { type: 'trade', id: P.id, a: P.a, b: P.b, room: P.room, picked: Object.keys(P.picks) };
         if (pid === P.a || pid === P.b) v.pending.giveable = me.hand.filter(c => this.canGive(me, c)).map(c => c.id);
@@ -1288,12 +1325,13 @@ function clientMain() {
     const pickOne = ids => (ids.includes(ui.shownFor) ? ui.shownFor : ids[0]) || null;
     if (P && P.type === 'trade') { const w = [P.a, P.b].filter(id => !P.picked.includes(id)); if (w.length) return pickOne(w); }
     if (P && P.type === 'armor' && P.waiting.length) return pickOne(P.waiting);
-    if (P && P.type === 'entry') return P.pid;
+    if (P && (P.type === 'entry' || P.type === 'pphase')) return P.pid;
     return S.turn ? S.turn.pid : null;
   }
   function localName(pid) { const p = (sess.players || []).find(x => x.pid === pid); return p ? p.name : '?'; }
   function checkCurtain() {
     if (!sess || !sess.local || !S) return;
+    if (ui.epicBusy) return; // сначала досмотреть бросок кубика, потом шторка
     if (S.phase === 'over') { hideCurtain(); renderHandoff(null); return; }
     const need = needPid();
     if (!need || need === ui.shownFor) { if (need && S.me === need) hideCurtain(); renderHandoff(null); return; }
@@ -1309,6 +1347,7 @@ function clientMain() {
     const prev = ui.shownFor && S.me === ui.shownFor ? ui.shownFor : null;
     const why = S.pending && S.pending.type === 'trade' ? 'Нужно выбрать карту для обмена.'
       : S.pending && S.pending.type === 'armor' ? 'Ваших персонажей атакуют — решите, играть ли бронежилет.'
+      : S.pending && S.pending.type === 'pphase' ? 'Новый раунд — бросьте кубик фазы паразитов.'
       : 'Ваш ход.';
     c.innerHTML = `<div class="cbox">
         <img class="logo" src="${IMG}logo.jpg" alt="">
@@ -1440,7 +1479,7 @@ function clientMain() {
         <span title="Карты исследования (следующая видна всем)" class="chip clickable" id="expChip">🧭 ${S.expCount}</span>
         <span title="Колода поиска / сброс" class="chip">🂠 ${S.deckCount} / ${S.discardCount}</span>
         <span title="Паразиты в запасе: серые / чёрные" class="chip"><img src="${IMG}parasite_gray.png">${S.reserve.gray} <img src="${IMG}parasite_black.png">${S.reserve.black}</span>
-        ${marker ? `<span class="chip" title="Следующую фазу паразитов проводит этот игрок">🎲 фаза паразитов: ${esc(marker.name)}</span>` : ''}
+        ${marker ? `<span class="chip" title="Этот игрок открывает раунд и бросает кубик фазы паразитов">🎲 фаза паразитов: ${esc(marker.name)}</span>` : ''}
         ${S.doorsOpen ? '<span class="chip doors" title="Терминал открыл двери до следующей фазы паразитов">🔓 двери открыты</span>' : ''}
         ${r ? `<span class="chip die" title="Последний бросок: ${esc(r.by)} — ${esc(r.why)}">🎲 ${r.v} ${DIR_ARROW[r.dir]}</span>` : ''}
         <span class="chip">Нужно канистр: ${S.gasToBurn}</span>
@@ -1505,7 +1544,13 @@ function clientMain() {
       s += `<div class="tok ch${mine ? ' mine' : ''}${sel}" data-pid="${p.id}" data-kind="${k}" title="${esc(p.name)} — ${KIND[k]} (${c.hp}/4)" style="--pc:${S.colors[p.color].hex}">
         <img src="${IMG}tok_${k}_${p.color}.png" alt=""><span class="kb">${k === 'trooper' ? 'Ш' : 'А'}</span><span class="hp">${'♥'.repeat(c.hp)}</span></div>`;
     }
-    for (const q of S.parasites) if (q.room === key) s += `<img class="tok par" src="${IMG}parasite_${q.side}.png" title="${q.side === 'black' ? 'Чёрный паразит (2 урона, 2 попадания)' : 'Серый паразит (1 урон)'}" alt="">`;
+    // паразиты, сдвинутые последним броском, подсвечены, рядом — стрелка, куда они ползли
+    const lr = S.lastRoll && (S.lastRoll.kind === 'phase' || S.lastRoll.kind === 'spawn') ? S.lastRoll : null;
+    for (const q of S.parasites) if (q.room === key) {
+      const mv = lr && (lr.moves || []).find(m => m.id === q.id && m.to === key);
+      s += `<img class="tok par${mv ? ' pmoved' : ''}" src="${IMG}parasite_${q.side}.png" title="${q.side === 'black' ? 'Чёрный паразит (2 урона, 2 попадания)' : 'Серый паразит (1 урон)'}" alt="">`;
+      if (mv && mv.moved) s += `<span class="parr" title="Приполз сюда последним броском">${DIR_ARROW[lr.dir]}</span>`;
+    }
     return s;
   }
   function boardBounds(extra) {
@@ -1870,6 +1915,11 @@ function clientMain() {
         if (!ui.minimized[key] && !busy) openTrade(P, key, partner);
       } else if (mine) { bannerHTML = `Ждём, пока ${nm(partner)} выберет карту для обмена…`; if (ui.modalKey === key) closeModal(); }
       else bannerHTML = `${nm(P.a)} и ${nm(P.b)} обмениваются картами (${P.picked.length}/2 выбрали)…`;
+    } else if (P.type === 'pphase') {
+      if (P.pid === S.me) {
+        bannerHTML = `Фаза паразитов: бросьте кубик. <button class="btn tiny" id="bnOpen">Бросить</button>`;
+        if (!ui.minimized[key] && !busy) openPhase(P, key);
+      } else bannerHTML = `☣ Фаза паразитов: ${nm(P.pid)} бросает кубик…`;
     } else if (P.type === 'armor') {
       if (P.mine && P.waiting.includes(S.me)) {
         bannerHTML = `Вас атакуют! Сыграть бронежилет? <button class="btn tiny" id="bnOpen">Решить</button>`;
@@ -1905,6 +1955,11 @@ function clientMain() {
       });
     }, key, true);
   }
+  function openPhase(P, key) {
+    if (ui.modalKey === key) return;
+    showModal('☣ Фаза паразитов', `<p>Начинается новый раунд. Бросьте кубик D4: <b>все паразиты</b> (${P.onBoard} на станции) поползут в выпавшую сторону — 1 ↑, 2 →, 3 ↓, 4 ← — если там открытый проход, а потом атакуют всех в своих комнатах.</p>`,
+      [{ t: '🎲 Бросить кубик', f: () => { ui.sent = key; act({ type: 'pphaseRoll' }).then(() => setTimeout(() => { if (ui.sent === key) { ui.sent = null; renderPending(); } }, 1500)); } }], null, key, true);
+  }
   function openArmor(P, key) {
     if (ui.modalKey === key) return;
     const m = P.mine; const hits = Object.entries(m.hits).filter(([k, n]) => n).map(([k, n]) => `${KIND[k]}: −${n}`).join(', ');
@@ -1916,9 +1971,9 @@ function clientMain() {
 
   // ---------- события: кубик, сканирование, рука соперника, финал ----------
   function handleEvents() {
-    const r = S.lastRoll;
-    if (r && r.seq > ui.seen.roll) {
-      if (ui.seen.roll) diceToast(r);
+    for (const r of S.rolls || []) {
+      if (r.seq <= ui.seen.roll) continue;
+      if (ui.initDone) { if (r.kind === 'phase' || r.kind === 'spawn') queueEpic(r); else diceToast(r); }
       ui.seen.roll = r.seq;
     }
     const sc = S.lastScan;
@@ -1934,6 +1989,41 @@ function clientMain() {
     }
     if (S.over && !ui.seen.over) { ui.seen.over = true; setTimeout(showOver, 600); }
     ui.initDone = true;
+  }
+  // большое окно броска кубика паразитов: кубик крутится, потом видно направление и кто куда пополз
+  const epicQ = [];
+  function queueEpic(r) { epicQ.push(r); if (!ui.epicBusy) nextEpic(); }
+  function nextEpic() {
+    const r = epicQ.shift();
+    if (!r) { ui.epicBusy = false; checkCurtain(); return; }
+    ui.epicBusy = true;
+    const DIR_RU = { up: 'ВВЕРХ', right: 'ВПРАВО', down: 'ВНИЗ', left: 'ВЛЕВО' };
+    const nm = s => s === 'black' ? '⚫ Чёрный паразит' : '⚪ Серый паразит';
+    const lines = (r.moves || []).map(m => m.moved
+      ? `<li>${nm(m.side)}: ${esc(roomLabel(m.from))} <b class="ear">${DIR_ARROW[r.dir]}</b> ${esc(roomLabel(m.to))}</li>`
+      : `<li>${nm(m.side)}: ${esc(roomLabel(m.from))} — прохода нет, остаётся</li>`).join('');
+    const title = r.kind === 'phase' ? '☣ ФАЗА ПАРАЗИТОВ' : '☣ ПАРАЗИТ!';
+    const sub = r.kind === 'phase' ? `Кубик бросает ${esc(r.by)}` : `Появился в комнате «${esc(roomLabel(r.spawnRoom))}» · бросает ${esc(r.by)}`;
+    const el = document.createElement('div'); el.id = 'epic';
+    el.innerHTML = `<div class="ebox">
+        <h2>${title}</h2><div class="esub">${sub}</div>
+        <div class="d4wrap"><div class="d4 spin"><span>?</span></div></div>
+        <div class="eres">
+          <div class="edir"><span class="bigarr">${DIR_ARROW[r.dir]}</span> ${r.v} — ${DIR_RU[r.dir]}</div>
+          <ul class="emoves">${lines}</ul>
+          <div class="enote">${r.kind === 'phase' ? 'Теперь паразиты атакуют всех в своих комнатах.' : 'Паразит атакует всех, кто оказался с ним в комнате.'}</div>
+          <button class="btn big" id="eOk">OK</button>
+        </div></div>`;
+    document.body.appendChild(el);
+    const d = el.querySelector('.d4'), sp = d.querySelector('span');
+    let n = 0; const tick = setInterval(() => { sp.textContent = 1 + (n++ % 4); }, 90);
+    setTimeout(() => {
+      clearInterval(tick); sp.textContent = r.v; d.classList.remove('spin'); d.classList.add('done');
+      el.querySelector('.eres').classList.add('show');
+    }, 1400);
+    const close = () => { if (!el.parentNode) return; el.remove(); nextEpic(); };
+    el.querySelector('#eOk').onclick = close;
+    setTimeout(close, 9000);
   }
   function diceToast(r) {
     const d = document.createElement('div'); d.className = 'dicetoast';
@@ -1986,7 +2076,7 @@ function clientMain() {
   <p><b>Ход.</b> Очки действия (ОД): персонаж с 3–4 ♥ даёт 2 ОД, с 1–2 ♥ — 1 ОД. ОД обоих персонажей общие. Каждое действие стоит 1 ОД:</p>
   <ul>
    <li><b>Пройти</b> через проход в соседнюю комнату (кликните подсвеченную комнату). Через закрытую дверь (красно-жёлтая) — только с ключ-картой или после терминала.</li>
-   <li><b>Исследовать</b> — выложить следующую карту рядом с комнатой персонажа (проход не может упираться в стену; две двери безопасности нельзя ставить вплотную).</li>
+   <li><b>Исследовать</b> — выложить следующую карту рядом с комнатой персонажа (проход не может упираться в стену; две двери безопасности нельзя ставить вплотную). Персонаж сразу входит в открытую комнату (если между ними не закрытая дверь).</li>
    <li><b>Обыскать</b> комнату со значком — взять карту. Карта комнаты станет красной; повторный обыск красной комнаты привлекает паразита.</li>
    <li><b>Стрелять</b> (только Андроид, нужны патроны на столе), <b>нож</b>, <b>граната</b>, <b>сканер</b> — см. карты.</li>
    <li><b>Терминал</b>: тепловое сканирование (сколько заражённых), открыть все двери до фазы паразитов, или выложить новую локацию где угодно.</li>
@@ -1994,8 +2084,8 @@ function clientMain() {
   </ul>
   <p><b>Предметы</b> можно разыгрывать при любом количестве карт на руке (в этой версии нет правила «минимум 5 карт»). Если вам нечего отдать при обмене, обмен с вами не начинается.</p>
   <p><b>Обмен.</b> Войдя в комнату (кроме Реактора), где есть чужие персонажи, вы обязаны <b>обменяться</b> с одним из игроков картой вслепую — или атаковать его. Заражённый может отдать карту заражения <b>своего цвета</b>: получатель заражается, если в ответ не отдал <b>канистру</b>. Человек не может отдавать карты заражения своего цвета. Заражение действует на обоих ваших персонажей.</p>
-  <p><b>Фаза паразитов.</b> Каждый круг (раз в «число игроков + 1» ходов) игрок с маркером бросает D4: все паразиты ползут в одном направлении (1 ↑, 2 →, 3 ↓, 4 ←, как на Реакторе), если там открытый проход. Потом атакуют всех в своей комнате: серый — 1 урон, чёрный — 2. Бронежилет снимает 1 урон (вам предложат сыграть его автоматически).</p>
-  <p><b>Паразиты появляются</b> от «Тревоги» в колоде, при входе в комнату с паразитом на значке и при повторном использовании красных комнат: D4 → в соседнюю комнату в этом направлении (стены не мешают).</p>
+  <p><b>Фаза паразитов.</b> Один раз за раунд — перед ходом игрока, который открывает раунд, — он бросает D4: все паразиты ползут в одном направлении (1 ↑, 2 →, 3 ↓, 4 ←, как на Реакторе), если там открытый проход. Потом атакуют всех в своей комнате: серый — 1 урон, чёрный — 2. Бронежилет снимает 1 урон (вам предложат сыграть его автоматически).</p>
+  <p><b>Паразиты появляются</b> от «Тревоги» в колоде, при обыске комнаты со значком паразита и при повторном использовании красных комнат. Паразит появляется в этой комнате, бросается D4, он ползёт в выпавшую сторону (если там открытый проход) и только потом атакует всех, кто оказался с ним в комнате. В начале игры паразитов на станции нет.</p>
   <p><b>Конец игры.</b> Люди побеждают, сжигая Улей. Заражённые побеждают, если сканирование показало, что все заражены; если остался один человек без канистр; если не осталось живых незаражённых Штурмовиков. Последний заражённый в победе заражённых не участвует (кроме случая, когда Носитель никого не заразил).</p>
   <p><b>Оригиналы:</b> <a href="/assets/docs/Panic_Station_rules_V2.0.pdf" target="_blank">правила (PDF, англ.)</a> · <a href="/assets/docs/Game_Aid_Front.pdf" target="_blank">памятка 1</a> · <a href="/assets/docs/Game_Aid_Back.pdf" target="_blank">памятка 2</a> · <a href="/assets/docs/Strategy_Humans.pdf" target="_blank">стратегия людей</a> · <a href="/assets/docs/Strategy_Infected.pdf" target="_blank">стратегия заражённых</a></p>
   </div>`;
@@ -2081,7 +2171,8 @@ body.ingame{overflow:hidden}
 .tbtns{display:flex;gap:6px;align-items:center}
 .conn{width:10px;height:10px;border-radius:50%;display:inline-block}
 .conn.ok{background:var(--grn)} .conn.bad{background:var(--red)}
-#boardWrap{position:relative;overflow:hidden;background:#090b0c url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='40'%3E%3Cpath d='M0 0h40v40H0z' fill='none' stroke='%23151a1c' stroke-width='1'/%3E%3C/svg%3E");cursor:grab;touch-action:none}
+#boardWrap{position:relative;overflow:hidden;background:#090b0c url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='40'%3E%3Cpath d='M0 0h40v40H0z' fill='none' stroke='%23151a1c' stroke-width='1'/%3E%3C/svg%3E");cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
+#top,#bottom,#players{user-select:none;-webkit-user-select:none}
 #boardInner{position:absolute;left:0;top:0;transform-origin:0 0}
 .pos{position:absolute;width:150px;height:210px}
 .tile{position:relative;width:150px;height:210px;border-radius:9px;overflow:hidden;background:#1a1e20;box-shadow:inset 0 0 0 2px #050606}
@@ -2135,6 +2226,28 @@ body.ingame{overflow:hidden}
 .tok .kb{position:absolute;right:-5px;top:-5px;background:var(--pc);color:#000;font:bold 10px/14px Arial;width:15px;height:15px;border-radius:50%;text-align:center;border:1px solid #000}
 .tok .hp{position:absolute;left:50%;bottom:-8px;transform:translateX(-50%);font-size:9px;color:#ff4d4d;text-shadow:0 0 2px #000,0 0 2px #000;white-space:nowrap;letter-spacing:-1px}
 .tok.par{width:34px;height:34px;border-radius:50%;box-shadow:0 2px 6px #000}
+.tok.par.pmoved{box-shadow:0 0 0 2px #ff5a45,0 0 12px 3px #ff5a45}
+.parr{color:#ff5a45;font:bold 20px Impact,sans-serif;text-shadow:0 0 4px #000;align-self:center}
+#epic{position:fixed;inset:0;z-index:70;background:radial-gradient(circle,rgba(90,10,5,.75),rgba(0,0,0,.92));display:flex;align-items:center;justify-content:center;animation:epicIn .35s ease-out}
+#epic .ebox{text-align:center;max-width:92vw;width:520px}
+#epic h2{font:44px Impact,sans-serif;letter-spacing:3px;color:#ff5a45;margin:0;text-shadow:0 0 18px #f00,0 0 4px #000;animation:pulse 1s infinite alternate}
+#epic .esub{color:#cfc6b3;margin:6px 0 18px}
+.d4wrap{height:170px;display:flex;align-items:center;justify-content:center;perspective:600px}
+.d4{width:150px;height:130px;background:linear-gradient(160deg,#f2c21b,#a86f00);clip-path:polygon(50% 0,100% 100%,0 100%);display:flex;align-items:flex-end;justify-content:center;filter:drop-shadow(0 0 14px #f2b51b)}
+.d4 span{font:64px Impact,sans-serif;color:#1a1200;margin-bottom:6px}
+.d4.spin{animation:d4spin .35s linear infinite}
+.d4.done{animation:d4land .5s ease-out;filter:drop-shadow(0 0 30px #ff5a45)}
+#epic .eres{opacity:0;transform:translateY(12px);transition:all .4s}
+#epic .eres.show{opacity:1;transform:none}
+#epic .edir{font:30px Impact,sans-serif;color:#fff;margin:10px 0}
+#epic .bigarr{display:inline-block;font-size:60px;color:#ff5a45;vertical-align:middle;animation:pulse .6s infinite alternate}
+#epic .emoves{list-style:none;padding:0;margin:8px 0;color:#e8e0cc;text-align:left;display:inline-block;max-height:30vh;overflow:auto}
+#epic .emoves li{margin:4px 0}#epic .ear{color:#ff5a45}
+#epic .enote{color:var(--mut);font-size:13px;margin:6px 0 14px}
+@keyframes epicIn{from{opacity:0;transform:scale(1.15)}}
+@keyframes pulse{to{opacity:.65}}
+@keyframes d4spin{0%{transform:rotate(0) rotateY(0) scale(.9)}50%{transform:rotate(180deg) rotateY(180deg) scale(1.05)}100%{transform:rotate(360deg) rotateY(360deg) scale(.9)}}
+@keyframes d4land{0%{transform:scale(1.5)}60%{transform:scale(.9)}100%{transform:scale(1)}}
 .zoombtns{position:absolute;right:8px;top:8px;display:flex;flex-direction:column;gap:4px;z-index:5}
 #banner{display:none;position:absolute;left:50%;top:10px;transform:translateX(-50%);background:rgba(60,20,10,.95);border:1px solid #e0703f;border-radius:8px;padding:8px 14px;z-index:6;max-width:80%;text-align:center}
 #modeHint{display:none;position:absolute;left:50%;bottom:10px;transform:translateX(-50%);background:rgba(40,35,10,.95);border:1px solid var(--acc);border-radius:8px;padding:8px 14px;z-index:6}
